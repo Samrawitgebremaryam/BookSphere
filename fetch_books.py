@@ -1,0 +1,192 @@
+import pandas as pd
+import requests
+from neo4j import GraphDatabase
+import logging
+import nltk
+from nltk.tokenize import word_tokenize
+from dotenv import load_dotenv
+import os
+import csv
+import random
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+# Neo4j connection with retry
+def create_driver(uri, user, password, retries=3, backoff_factor=2):
+    for attempt in range(retries):
+        try:
+            driver = GraphDatabase.driver(
+                uri,
+                auth=(user, password),
+                max_connection_lifetime=30,
+                max_connection_pool_size=50,
+                connection_timeout=15
+            )
+            with driver.session() as session:
+                session.run("RETURN 1")
+            logger.info("Connected to Neo4j")
+            return driver
+        except Exception as e:
+            logger.warning(f"Neo4j connection attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(backoff_factor ** attempt)
+    logger.error("Failed to connect to Neo4j after retries")
+    exit(1)
+
+driver = create_driver(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+
+# Configure requests with retries for Open Library
+session = requests.Session()
+retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
+def load_kaggle_books(file_path="data/books.csv"):
+    try:
+        df = pd.read_csv(file_path, quoting=csv.QUOTE_ALL, escapechar='\\')
+        df.columns = [col.strip() for col in df.columns]
+        required_columns = ["bookID", "title", "authors", "average_rating", "isbn", "language_code", "num_pages", "publisher"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            logger.error(f"Missing columns in CSV: {missing_columns}")
+            return pd.DataFrame()
+        df = df[required_columns].head(1000)
+        df["bookId"] = df["bookID"].apply(lambda x: f"BOOK_{x}")
+        df["avgRating"] = df["average_rating"].fillna(4.0)
+        df["genres"] = df["title"].apply(
+            lambda x: ["Fantasy"] if any(k in str(x).lower() for k in ["harry potter", "lord of the rings", "hobbit"]) else
+                      ["Mystery"] if any(k in str(x).lower() for k in ["sherlock", "mystery", "detective"]) else
+                      ["Romance"] if any(k in str(x).lower() for k in ["pride and prejudice", "love", "romance"]) else
+                      ["Science Fiction"] if any(k in str(x).lower() for k in ["dune", "foundation"]) else
+                      ["Fiction"]
+        )
+        df["description"] = df["title"].apply(lambda x: f"A captivating story about {x}")
+        df["url"] = df["isbn"].apply(lambda x: f"https://www.goodreads.com/book/isbn/{x}")
+        logger.info(f"Loaded {len(df)} books from Kaggle data")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading Kaggle data: {e}")
+        return pd.DataFrame()
+
+def fetch_openlibrary_book(isbn):
+    try:
+        url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+        start_time = time.time()
+        response = session.get(url, timeout=3)  # Reduced timeout
+        response.raise_for_status()
+        elapsed = time.time() - start_time
+        if elapsed > 2:
+            logger.warning(f"Slow API response for ISBN {isbn}: {elapsed:.2f}s")
+        data = response.json()
+        book = data.get(f"ISBN:{isbn}", {})
+        genres = [subject.get("name", subject) if isinstance(subject, dict) else subject 
+                  for subject in book.get("subjects", ["Fiction"])][:3]
+        description = book.get("description", f"A captivating story about {book.get('title', 'this book')}")
+        if isinstance(description, dict):
+            description = description.get("value", description)
+        return {
+            "description": description,
+            "genres": genres,
+            "url": book.get("url", f"https://openlibrary.org/isbn/{isbn}")
+        }
+    except RequestException as e:
+        logger.info(f"No Open Library data for ISBN {isbn}: {e}")
+        return None
+
+def import_books_to_neo4j(books_df):
+    def create_book(tx, book, index):
+        query = """
+        MERGE (b:Book {bookId: $bookId})
+        SET b.title = $title, b.authors = $authors, b.avgRating = $avgRating,
+            b.language = $language_code, b.numPages = $num_pages,
+            b.publisher = $publisher, b.description = $description, b.url = $url
+        """
+        tx.run(query, **book)
+        for genre in book["genres"]:
+            genre_query = """
+            MATCH (b:Book {bookId: $bookId})
+            MERGE (g:Genre {name: $genre})
+            MERGE (b)-[:HAS_GENRE]->(g)
+            """
+            tx.run(genre_query, bookId=book["bookId"], genre=genre)
+        if book["description"]:
+            try:
+                tokens = word_tokenize(book["description"].lower())
+                keywords = [t for t in tokens if t.isalpha() and len(t) > 3][:5]
+                for keyword in keywords:
+                    keyword_query = """
+                    MATCH (b:Book {bookId: $bookId})
+                    MERGE (k:Keyword {name: $keyword})
+                    MERGE (b)-[:HAS_KEYWORD]->(k)
+                    """
+                    tx.run(keyword_query, bookId=book["bookId"], keyword=keyword)
+            except Exception as e:
+                logger.warning(f"Skipping keywords for {book['title']} due to NLTK error: {e}")
+        logger.info(f"Imported book {index + 1}/{len(books_df)}: {book['title']}")
+
+    try:
+        with driver.session() as session:
+            for index, (_, book) in enumerate(books_df.iterrows()):
+                book_data = book.to_dict()
+                api_data = fetch_openlibrary_book(book["isbn"])
+                if api_data:
+                    book_data.update(api_data)
+                session.execute_write(create_book, book_data, index)
+        logger.info("Imported books to Neo4j")
+    except Exception as e:
+        logger.error(f"Error importing books: {e}")
+    finally:
+        logger.info("Closing Neo4j session")
+
+def create_synthetic_users(books_df):
+    def create_user(tx, user_id, book_ids, ratings):
+        tx.run("MERGE (u:User {userId: $userId})", userId=user_id)
+        query = """
+        UNWIND $pairs AS pair
+        MATCH (u:User {userId: $userId})
+        MATCH (b:Book {bookId: pair.bookId})
+        MERGE (u)-[:RATED {rating: pair.rating}]->(b)
+        """
+        pairs = [{"bookId": book_id, "rating": rating} for book_id, rating in zip(book_ids, ratings)]
+        tx.run(query, userId=user_id, pairs=pairs)
+        logger.info(f"Created user {user_id}")
+
+    try:
+        with driver.session() as session:
+            for i in range(1, 101):  # 100 users
+                sample_books = books_df.sample(n=min(10, len(books_df)))
+                book_ids = sample_books["bookId"].tolist()
+                ratings = [random.randint(3, 5) for _ in range(len(book_ids))]
+                session.execute_write(create_user, f"U{i}", book_ids, ratings)
+        logger.info("Created synthetic users")
+    except Exception as e:
+        logger.error(f"Error creating users: {e}")
+    finally:
+        logger.info("Closing Neo4j session")
+
+if __name__ == "__main__":
+    try:
+        books_df = load_kaggle_books()
+        if not books_df.empty:
+            print("Loaded Books:")
+            print(books_df[["title", "authors", "avgRating", "genres", "url"]].head())
+            import_books_to_neo4j(books_df)
+            create_synthetic_users(books_df)
+        else:
+            logger.warning("No books loaded")
+    except KeyboardInterrupt:
+        logger.info("Script interrupted by user")
+    finally:
+        driver.close()
+        logger.info("Neo4j driver closed")
