@@ -1,5 +1,4 @@
 import pandas as pd
-import requests
 from neo4j import GraphDatabase
 import logging
 import nltk
@@ -8,9 +7,6 @@ from dotenv import load_dotenv
 import os
 import csv
 import random
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException
 import time
 
 # Configure logging
@@ -47,11 +43,6 @@ def create_driver(uri, user, password, retries=3, backoff_factor=2):
 
 driver = create_driver(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-# Configure requests with retries for Open Library
-session = requests.Session()
-retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
-
 def load_kaggle_books(file_path="data/books.csv"):
     try:
         df = pd.read_csv(file_path, quoting=csv.QUOTE_ALL, escapechar='\\')
@@ -78,31 +69,6 @@ def load_kaggle_books(file_path="data/books.csv"):
     except Exception as e:
         logger.error(f"Error loading Kaggle data: {e}")
         return pd.DataFrame()
-
-def fetch_openlibrary_book(isbn):
-    try:
-        url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
-        start_time = time.time()
-        response = session.get(url, timeout=3)  # Reduced timeout
-        response.raise_for_status()
-        elapsed = time.time() - start_time
-        if elapsed > 2:
-            logger.warning(f"Slow API response for ISBN {isbn}: {elapsed:.2f}s")
-        data = response.json()
-        book = data.get(f"ISBN:{isbn}", {})
-        genres = [subject.get("name", subject) if isinstance(subject, dict) else subject 
-                  for subject in book.get("subjects", ["Fiction"])][:3]
-        description = book.get("description", f"A captivating story about {book.get('title', 'this book')}")
-        if isinstance(description, dict):
-            description = description.get("value", description)
-        return {
-            "description": description,
-            "genres": genres,
-            "url": book.get("url", f"https://openlibrary.org/isbn/{isbn}")
-        }
-    except RequestException as e:
-        logger.info(f"No Open Library data for ISBN {isbn}: {e}")
-        return None
 
 def import_books_to_neo4j(books_df):
     def create_book(tx, book, index):
@@ -139,9 +105,6 @@ def import_books_to_neo4j(books_df):
         with driver.session() as session:
             for index, (_, book) in enumerate(books_df.iterrows()):
                 book_data = book.to_dict()
-                api_data = fetch_openlibrary_book(book["isbn"])
-                if api_data:
-                    book_data.update(api_data)
                 session.execute_write(create_book, book_data, index)
         logger.info("Imported books to Neo4j")
     except Exception as e:

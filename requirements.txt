@@ -7,3 +7,4 @@ tensorflow==2.17.0
 nltk==3.9.1
 pillow==10.4.0
 python-dotenv==1.0.1
+
