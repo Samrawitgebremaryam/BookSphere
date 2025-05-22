@@ -9,26 +9,20 @@ import csv
 import random
 import time
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-# Neo4j connection with retry
 def create_driver(uri, user, password, retries=3, backoff_factor=2):
     for attempt in range(retries):
         try:
             driver = GraphDatabase.driver(
-                uri,
-                auth=(user, password),
-                max_connection_lifetime=30,
-                max_connection_pool_size=50,
-                connection_timeout=15
+                uri, auth=(user, password), max_connection_lifetime=30,
+                max_connection_pool_size=50, connection_timeout=15
             )
             with driver.session() as session:
                 session.run("RETURN 1")
@@ -47,7 +41,7 @@ def load_kaggle_books(file_path="data/books.csv"):
     try:
         df = pd.read_csv(file_path, quoting=csv.QUOTE_ALL, escapechar='\\')
         df.columns = [col.strip() for col in df.columns]
-        required_columns = ["bookID", "title", "authors", "average_rating", "isbn", "language_code", "num_pages", "publisher"]
+        required_columns = ["bookID", "title", "authors", "average_rating", "isbn", "language_code", "num_pages", "ratings_count", "publisher"]
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             logger.error(f"Missing columns in CSV: {missing_columns}")
@@ -55,14 +49,20 @@ def load_kaggle_books(file_path="data/books.csv"):
         df = df[required_columns].head(1000)
         df["bookId"] = df["bookID"].apply(lambda x: f"BOOK_{x}")
         df["avgRating"] = df["average_rating"].fillna(4.0)
+        df["ratingsCount"] = df["ratings_count"].fillna(0)
+        df["isbn"] = df["isbn"].str.strip()  # Clean ISBN for image fetching
         df["genres"] = df["title"].apply(
-            lambda x: ["Fantasy"] if any(k in str(x).lower() for k in ["harry potter", "lord of the rings", "hobbit"]) else
-                      ["Mystery"] if any(k in str(x).lower() for k in ["sherlock", "mystery", "detective"]) else
-                      ["Romance"] if any(k in str(x).lower() for k in ["pride and prejudice", "love", "romance"]) else
-                      ["Science Fiction"] if any(k in str(x).lower() for k in ["dune", "foundation"]) else
+            lambda x: ["Fantasy"] if any(k in str(x).lower() for k in ["harry potter", "lord of the rings", "hobbit", "dragon", "wizard", "magic", "quest", "adventure", "epic"]) else
+                      ["Science Fiction"] if any(k in str(x).lower() for k in ["dune", "foundation", "space", "alien", "galaxy", "star", "robot", "future", "tech"]) else
+                      ["Mystery"] if any(k in str(x).lower() for k in ["sherlock", "mystery", "detective", "crime", "thriller"]) else
+                      ["Romance"] if any(k in str(x).lower() for k in ["pride and prejudice", "love", "romance", "heart", "passion"]) else
+                      ["Non-Fiction"] if any(k in str(x).lower() for k in ["biography", "history", "science", "business"]) else
                       ["Fiction"]
         )
-        df["description"] = df["title"].apply(lambda x: f"A captivating story about {x}")
+        df["description"] = df.apply(
+            lambda x: f"{x['title']} by {x['authors']}, a {', '.join(x['genres']).lower()} book with {x['num_pages']} pages.",
+            axis=1
+        )
         df["url"] = df["isbn"].apply(lambda x: f"https://www.goodreads.com/book/isbn/{x}")
         logger.info(f"Loaded {len(df)} books from Kaggle data")
         return df
@@ -75,8 +75,9 @@ def import_books_to_neo4j(books_df):
         query = """
         MERGE (b:Book {bookId: $bookId})
         SET b.title = $title, b.authors = $authors, b.avgRating = $avgRating,
-            b.language = $language_code, b.numPages = $num_pages,
-            b.publisher = $publisher, b.description = $description, b.url = $url
+            b.ratingsCount = $ratingsCount, b.language = $language_code,
+            b.numPages = $num_pages, b.publisher = $publisher,
+            b.description = $description, b.url = $url, b.isbn = $isbn
         """
         tx.run(query, **book)
         for genre in book["genres"]:
@@ -127,10 +128,10 @@ def create_synthetic_users(books_df):
 
     try:
         with driver.session() as session:
-            for i in range(1, 101):  # 100 users
-                sample_books = books_df.sample(n=min(10, len(books_df)))
+            for i in range(1, 101):
+                sample_books = books_df.sample(n=min(20, len(books_df)))
                 book_ids = sample_books["bookId"].tolist()
-                ratings = [random.randint(3, 5) for _ in range(len(book_ids))]
+                ratings = [random.randint(1, 5) for _ in range(len(book_ids))]
                 session.execute_write(create_user, f"U{i}", book_ids, ratings)
         logger.info("Created synthetic users")
     except Exception as e:
@@ -143,7 +144,7 @@ if __name__ == "__main__":
         books_df = load_kaggle_books()
         if not books_df.empty:
             print("Loaded Books:")
-            print(books_df[["title", "authors", "avgRating", "genres", "url"]].head())
+            print(books_df[["title", "authors", "avgRating", "genres", "ratingsCount", "isbn"]].head())
             import_books_to_neo4j(books_df)
             create_synthetic_users(books_df)
         else:
