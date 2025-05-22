@@ -136,6 +136,20 @@ def content_based_recommendation(books_df, book_title, top_n=4):
         logger.error(f"Content-based recommendation error: {e}")
         return []
 
+def get_eligible_collaborative_books(ratings_df, books_df, min_user_ratings=10, min_book_ratings=5):
+    """
+    Returns a list of book titles that have enough ratings to be used in collaborative filtering.
+    """
+    user_counts = ratings_df["userId"].value_counts()
+    book_counts = ratings_df["bookId"].value_counts()
+    ratings_filtered = ratings_df[
+        (ratings_df["userId"].isin(user_counts[user_counts > min_user_ratings].index)) &
+        (ratings_df["bookId"].isin(book_counts[book_counts > min_book_ratings].index))
+    ]
+    eligible_book_ids = set(ratings_filtered["bookId"].unique())
+    eligible_books_df = books_df[books_df["bookId"].isin(eligible_book_ids)]
+    return eligible_books_df["title"].dropna().unique().tolist()
+
 if __name__ == "__main__":
     try:
         books_df, ratings_df = load_data()

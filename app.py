@@ -5,7 +5,13 @@ from dotenv import load_dotenv
 import os
 import requests
 import base64
-from recommender import load_data, popularity_based_recommendation, collaborative_filtering, content_based_recommendation
+from recommender import (
+    load_data,
+    popularity_based_recommendation,
+    collaborative_filtering,
+    content_based_recommendation,
+    get_eligible_collaborative_books,  # <-- add this import
+)
 
 st.set_page_config(page_title="BookSphere", page_icon="📚", layout="wide")
 
@@ -24,7 +30,17 @@ def get_book_cover(isbn):
     return "https://via.placeholder.com/150x200.png?text=No+Cover"
 
 books_df, ratings_df = load_data()
-book_titles = books_df["title"].dropna().unique().tolist() if books_df is not None else []
+
+if books_df is None or ratings_df is None:
+    st.error("Failed to load data from the database. Please check your Neo4j connection and try again.")
+    st.stop()
+
+# Prepare book lists
+all_book_titles = books_df["title"].dropna().unique().tolist()
+collab_book_titles = get_eligible_collaborative_books(ratings_df, books_df)  # Only books with enough ratings
+rated_book_ids = set(ratings_df["bookId"].unique())
+rated_books_df = books_df[books_df["bookId"].isin(rated_book_ids)]
+rated_book_titles = rated_books_df["title"].dropna().unique().tolist()
 
 # Sidebar
 st.sidebar.title("BookSphere Options")
@@ -61,33 +77,55 @@ if page == "Home":
 
     # Quick Recommendation with selectbox
     st.subheader("Get a Quick Recommendation")
-    book_title = st.selectbox("Pick a book title", [""] + book_titles)
-    rec_type = st.selectbox("Recommend by", ["Similar to You", "Similar to This Book"])
+    rec_type = st.selectbox("Recommend by", ["Similar to You", "Similar to This Book"], key="quick_rec_type")
+    if rec_type == "Similar to You":
+        book_title = st.selectbox("Pick a book title", [""] + collab_book_titles, key="quick_collab_title")
+    else:
+        book_title = st.selectbox("Pick a book title", [""] + all_book_titles, key="quick_content_title")
     if st.button("Recommend"):
         if book_title:
             if rec_type == "Similar to You":
                 recommendations = collaborative_filtering(ratings_df, books_df, book_title)
+                if recommendations:
+                    st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
+                    cols = st.columns(4)
+                    for idx, book in enumerate(recommendations):
+                        with cols[idx % 4]:
+                            cover = get_book_cover(book["isbn"])
+                            st.markdown(f"""
+                                <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
+                                    <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
+                                    <h4 style="color:#fff;">{book["title"]}</h4>
+                                    <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
+                                    <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
+                                    <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
+                                    <p style="color:#ccc;">{book["description"]}</p>
+                                    <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
+                                </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.warning("No recommendations found. Try another book title!")
             else:
                 recommendations = content_based_recommendation(books_df, book_title)
-            if recommendations:
-                st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
-                cols = st.columns(4)
-                for idx, book in enumerate(recommendations):
-                    with cols[idx % 4]:
-                        cover = get_book_cover(book["isbn"])
-                        st.markdown(f"""
-                            <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
-                                <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
-                                <h4 style="color:#fff;">{book["title"]}</h4>
-                                <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
-                                <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
-                                <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
-                                <p style="color:#ccc;">{book["description"]}</p>
-                                <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
-                            </div>
-                        """, unsafe_allow_html=True)
-            else:
-                st.warning("No recommendations found. Try another book title!")
+                if recommendations:
+                    st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
+                    cols = st.columns(4)
+                    for idx, book in enumerate(recommendations):
+                        with cols[idx % 4]:
+                            cover = get_book_cover(book["isbn"])
+                            st.markdown(f"""
+                                <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
+                                    <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
+                                    <h4 style="color:#fff;">{book["title"]}</h4>
+                                    <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
+                                    <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
+                                    <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
+                                    <p style="color:#ccc;">{book["description"]}</p>
+                                    <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
+                                </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.warning("No recommendations found. Try another book title!")
         else:
             st.warning("Please pick a book title.")
 
@@ -110,33 +148,55 @@ elif page == "Top 50 Books":
 
 elif page == "Recommendations":
     st.title("📚 Personalized Book Recommendations")
-    book_title = st.selectbox("Pick a book title", [""] + book_titles, key="rec_page")
     rec_type = st.selectbox("Recommend by", ["Similar to You", "Similar to This Book"], key="rec_type_page")
+    if rec_type == "Similar to You":
+        book_title = st.selectbox("Pick a book title", [""] + collab_book_titles, key="rec_page")
+    else:
+        book_title = st.selectbox("Pick a book title", [""] + all_book_titles, key="rec_page_content")
     if st.button("Get Recommendations"):
         if book_title:
             if rec_type == "Similar to You":
                 recommendations = collaborative_filtering(ratings_df, books_df, book_title)
+                if recommendations:
+                    st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
+                    cols = st.columns(4)
+                    for idx, book in enumerate(recommendations):
+                        with cols[idx % 4]:
+                            cover = get_book_cover(book["isbn"])
+                            st.markdown(f"""
+                                <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
+                                    <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
+                                    <h4 style="color:#fff;">{book["title"]}</h4>
+                                    <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
+                                    <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
+                                    <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
+                                    <p style="color:#ccc;">{book["description"]}</p>
+                                    <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
+                                </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.warning("No recommendations found. Try another book title!")
             else:
                 recommendations = content_based_recommendation(books_df, book_title)
-            if recommendations:
-                st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
-                cols = st.columns(4)
-                for idx, book in enumerate(recommendations):
-                    with cols[idx % 4]:
-                        cover = get_book_cover(book["isbn"])
-                        st.markdown(f"""
-                            <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
-                                <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
-                                <h4 style="color:#fff;">{book["title"]}</h4>
-                                <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
-                                <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
-                                <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
-                                <p style="color:#ccc;">{book["description"]}</p>
-                                <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
-                            </div>
-                        """, unsafe_allow_html=True)
-            else:
-                st.warning("No recommendations found. Try another book title!")
+                if recommendations:
+                    st.subheader(f"Recommendations for '{book_title}' ({rec_type})")
+                    cols = st.columns(4)
+                    for idx, book in enumerate(recommendations):
+                        with cols[idx % 4]:
+                            cover = get_book_cover(book["isbn"])
+                            st.markdown(f"""
+                                <div style="background-color: #222; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
+                                    <img src="{cover}" style="width:100%; height:200px; object-fit:cover; border-radius:5px;">
+                                    <h4 style="color:#fff;">{book["title"]}</h4>
+                                    <p style="color:#ccc;"><b>Author:</b> {book["authors"]}</p>
+                                    <p style="color:#ccc;"><b>Rating:</b> {book["avgRating"]}</p>
+                                    <p style="color:#ccc;"><b>Genres:</b> {', '.join(book["genres"])}</p>
+                                    <p style="color:#ccc;">{book["description"]}</p>
+                                    <a href="{book["url"]}" target="_blank" style="color:#4FC3F7;">View on Goodreads</a>
+                                </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.warning("No recommendations found. Try another book title!")
         else:
             st.warning("Please pick a book title.")
 
